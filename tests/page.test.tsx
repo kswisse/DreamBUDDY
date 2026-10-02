@@ -88,4 +88,58 @@ describe("JournalPage", () => {
     expect(screen.queryByText(/Showing the/)).toBeNull();
     expect(screen.getByText("0 entries")).toBeTruthy();
   });
+
+  it("uses the singular label when there is exactly one entry", () => {
+    repo.list = [makeDream("only")];
+    repo.count = 1;
+
+    render(<JournalPage />);
+
+    expect(screen.getByText("1 entry")).toBeTruthy();
+    expect(screen.queryByText(/entries/)).toBeNull();
+    expect(screen.queryByText(/Showing the/)).toBeNull();
+    expect(screen.getByText("Dream only")).toBeTruthy();
+  });
+
+  it("renders the content as the heading when the title is empty", () => {
+    repo.list = [{ ...makeDream("no-title"), title: "" }];
+    repo.count = 1;
+
+    render(<JournalPage />);
+
+    const heading = screen.getByRole("heading", { level: 2 });
+    expect(heading.textContent).toBe("A dream about flying.");
+  });
+
+  it("truncates the content fallback at 60 characters with no ellipsis", () => {
+    const content = `${"a".repeat(60)} trailing tail beyond the cut`;
+    repo.list = [{ ...makeDream("long"), title: "", content }];
+    repo.count = 1;
+
+    render(<JournalPage />);
+
+    const heading = screen.getByRole("heading", { level: 2 });
+    expect(heading.textContent).toBe("a".repeat(60));
+    expect(heading.textContent).not.toBe(content);
+  });
+
+  it("renders the mood chip for a mooded dream", () => {
+    repo.list = [makeDream("mooded")];
+    repo.count = 1;
+
+    render(<JournalPage />);
+
+    expect(screen.getByText("· calm")).toBeTruthy();
+  });
+
+  it("renders no mood chip when the mood is empty", () => {
+    repo.list = [{ ...makeDream("no-mood"), mood: "" }];
+    repo.count = 1;
+
+    render(<JournalPage />);
+
+    expect(screen.queryByText(/·/)).toBeNull();
+    expect(screen.getByText("2026-09-26")).toBeTruthy();
+    expect(screen.getByText("Not analyzed")).toBeTruthy();
+  });
 });

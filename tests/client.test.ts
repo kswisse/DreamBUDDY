@@ -1,4 +1,4 @@
-import { describe, it, expect, vi } from "vitest";
+import { describe, it, expect, vi, afterEach } from "vitest";
 import {
   analyzeDream,
   AiError,
@@ -436,6 +436,236 @@ describe("analyzeDream", () => {
       analyzeDream(dream, config, { fetchImpl: fetchMock, retryDelayMs: 0 }),
     ).rejects.toMatchObject({ code: "invalid_output" });
     expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
+  it("surfaces a top-level message string from a JSON error body", async () => {
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValue(jsonResponse({ message: "quota exhausted for this key" }, 401));
+    const config = loadConfig({ OPENAI_API_KEY: "sk-test" });
+
+    const err = await analyzeDream(dream, config, {
+      fetchImpl: fetchMock,
+      retryDelayMs: 0,
+    }).catch((e: unknown) => e);
+
+    expect(err).toBeInstanceOf(AiError);
+    expect((err as AiError).code).toBe("upstream_error");
+    expect((err as AiError).message).toContain("HTTP 401");
+    expect((err as AiError).message).toContain("quota exhausted for this key");
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("surfaces a top-level detail string from a JSON error body", async () => {
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValue(jsonResponse({ detail: "request body was rejected" }, 401));
+    const config = loadConfig({ OPENAI_API_KEY: "sk-test" });
+
+    const err = await analyzeDream(dream, config, {
+      fetchImpl: fetchMock,
+      retryDelayMs: 0,
+    }).catch((e: unknown) => e);
+
+    expect(err).toBeInstanceOf(AiError);
+    expect((err as AiError).code).toBe("upstream_error");
+    expect((err as AiError).message).toContain("HTTP 401");
+    expect((err as AiError).message).toContain("request body was rejected");
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("redacts a Bearer token that leaks into the error body", async () => {
+    const token = "sk-abc123secret";
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValue(
+        jsonResponse({ message: `Authorization failed for Bearer ${token}` }, 401),
+      );
+    const config = loadConfig({ OPENAI_API_KEY: "sk-test" });
+
+    const err = await analyzeDream(dream, config, {
+      fetchImpl: fetchMock,
+      retryDelayMs: 0,
+    }).catch((e: unknown) => e);
+
+    expect(err).toBeInstanceOf(AiError);
+    const message = (err as AiError).message;
+    expect(message).toContain("HTTP 401");
+    expect(message).toContain("Bearer ***");
+    expect(message).not.toContain(token);
+    expect(message).not.toContain("abc123secret");
+  });
+
+  it("appends the model hint when a 400 body mentions the configured model", async () => {
+    // fresh Response per attempt: a 400 body is drained once per try
+    const fetchMock = vi.fn().mockImplementation(() =>
+      Promise.resolve(
+        jsonResponse(
+          { detail: "The model gpt-oss-120b is not supported by this endpoint." },
+          400,
+        ),
+      ),
+    );
+    const config = loadConfig({ OPENAI_API_KEY: "sk-test" });
+
+    const err = await analyzeDream(dream, config, {
+      fetchImpl: fetchMock,
+      retryDelayMs: 0,
+    }).catch((e: unknown) => e);
+
+    expect(err).toBeInstanceOf(AiError);
+    const message = (err as AiError).message;
+    expect(message).toContain("HTTP 400");
+    expect(message).toContain(
+      "The model gpt-oss-120b is not supported by this endpoint.",
+    );
+    expect(message).toContain(
+      'Check DREAMBUDDY_MODEL ("gpt-oss-120b"): the endpoint rejected this model id.',
+    );
+    expect(message).toContain(
+      "gpt-oss-120b runs on OpenAI-compatible servers (Ollama, vLLM, LM Studio, NVIDIA NIM…), not api.openai.com.",
+    );
+    // 400 drops response_format once before the throw, so two attempts
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
+  it("caps a multi-kilobyte text/plain error body at 160 characters", async () => {
+    const tail = "TAIL_MARKER_7f3ac9";
+    const body = `ERR_UPSTREAM: ${"a".repeat(4096)} ${tail}`;
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response(body, {
+        status: 401,
+        headers: { "content-type": "text/plain" },
+      }),
+    );
+    const config = loadConfig({ OPENAI_API_KEY: "sk-test" });
+
+    const err = await analyzeDream(dream, config, {
+      fetchImpl: fetchMock,
+      retryDelayMs: 0,
+    }).catch((e: unknown) => e);
+
+    expect(err).toBeInstanceOf(AiError);
+    const message = (err as AiError).message;
+    // status-line prefix + a body prefix proves the plain-text path ran
+    expect(message).toContain("Model endpoint returned HTTP 401: ERR_UPSTREAM:");
+    expect(message).toContain(body.slice(0, 100));
+    // the cap keeps the multi-KB tail out of the surfaced message
+    expect(message).not.toContain(tail);
+    expect(message).not.toContain("a".repeat(200));
+    // Bound: 34 ("Model endpoint returned HTTP 401: ")
+    //      + 161 (MAX_ERROR_DETAIL_LENGTH 160 + the "…" ellipsis)
+    //      +   0 (modelHint only fires for HTTP 400/404)
+    //      = 195
+    expect(message.length).toBeLessThanOrEqual(195);
+  });
+
+  it("bounds the combined cap-plus-hint message stored as analysis_error", async () => {
+    // Worst case: HTTP 400 whose detail both hits the 160-char cap and
+    // triggers modelHint, so status-line + cap + full official hint all land
+    // in the single message that failAnalysis persists and the UI renders.
+    const detail = `Unsupported model gpt-oss-120b parameter: ${"z".repeat(500)}`;
+    // fresh Response per attempt: a 400 body is drained once per try
+    const fetchMock = vi.fn().mockImplementation(() =>
+      Promise.resolve(jsonResponse({ message: detail }, 400)),
+    );
+    const config = loadConfig({ OPENAI_API_KEY: "sk-test" });
+
+    const err = await analyzeDream(dream, config, {
+      fetchImpl: fetchMock,
+      retryDelayMs: 0,
+    }).catch((e: unknown) => e);
+
+    expect(err).toBeInstanceOf(AiError);
+    const message = (err as AiError).message;
+    expect(message).toContain("HTTP 400");
+    expect(message).toContain("DREAMBUDDY_MODEL");
+    expect(message).toContain("not api.openai.com");
+    // 160-char cap − 42-char prefix leaves ≤ 118 z's, never 120
+    expect(message).not.toContain("z".repeat(120));
+    // Derived bound:
+    //   34  status-line prefix ("Model endpoint returned HTTP 400: ")
+    // + 161 capped detail (MAX_ERROR_DETAIL_LENGTH 160 + "…")
+    // + 185 modelHint (78-char base + 107-char official-endpoint remark)
+    // = 380 → assert against 400
+    expect(message.length).toBeLessThanOrEqual(400);
+    // 400 drops response_format once before the throw, so two attempts
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+});
+
+describe("analyzeDream upstream timeout protection", () => {
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  const timeoutError = (): DOMException =>
+    new DOMException("The operation was aborted due to timeout", "TimeoutError");
+
+  it("passes an AbortSignal to every attempt", async () => {
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(jsonResponse({ error: "boom" }, 500))
+      .mockResolvedValueOnce(completionResponse(JSON.stringify(analysis)));
+    const config = loadConfig({ OPENAI_API_KEY: "sk-test" });
+
+    await analyzeDream(dream, config, { fetchImpl: fetchMock, retryDelayMs: 0 });
+
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    const inits = fetchMock.mock.calls.map(([, init]) => init as RequestInit);
+    for (const init of inits) {
+      expect(init).toEqual(
+        expect.objectContaining({ signal: expect.any(AbortSignal) }),
+      );
+    }
+  });
+
+  it("recovers when the first attempt is aborted by the request timeout", async () => {
+    vi.useFakeTimers();
+    try {
+      const fetchMock = vi
+        .fn()
+        .mockRejectedValueOnce(timeoutError())
+        .mockResolvedValueOnce(completionResponse(JSON.stringify(analysis)));
+      const config = loadConfig({ OPENAI_API_KEY: "sk-test" });
+
+      const pending = analyzeDream(dream, config, { fetchImpl: fetchMock });
+      // attempt-1 backoff is 500ms * 0.5–1.5 jitter → ≤ 750ms of virtual time;
+      // the repeats flush later microtasks (json() of the winning response)
+      for (let i = 0; i < 20; i++) await vi.advanceTimersByTimeAsync(500);
+
+      const result = await pending;
+      expect(result.summary).toBe(analysis.summary);
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("gives up with upstream_error when every attempt times out", async () => {
+    vi.useFakeTimers();
+    try {
+      const fetchMock = vi
+        .fn()
+        .mockImplementation(() => Promise.reject(timeoutError()));
+      const config = loadConfig({ OPENAI_API_KEY: "sk-test" });
+
+      const pending = analyzeDream(dream, config, { fetchImpl: fetchMock }).catch(
+        (e: unknown) => e,
+      );
+      // attempt-1 backoff ≤ 750ms, attempt-2 backoff ≤ 1500ms, so 20s of
+      // virtual time clears the whole 3-attempt budget instantly
+      for (let i = 0; i < 40; i++) await vi.advanceTimersByTimeAsync(500);
+
+      const err = await pending;
+      expect(err).toBeInstanceOf(AiError);
+      expect((err as AiError).code).toBe("upstream_error");
+      expect((err as AiError).message).toContain("Could not reach the model endpoint");
+      expect((err as AiError).message).toContain("timeout");
+      expect(fetchMock).toHaveBeenCalledTimes(3);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });
 

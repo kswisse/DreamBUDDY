@@ -1,5 +1,6 @@
 import { getRepository } from "@/lib/repository";
 import { ValidationError } from "@/lib/dreams";
+import { crossOriginRejection } from "@/lib/origin";
 
 function errorResponse(status: number, code: string, message: string): Response {
   return Response.json({ error: { code, message } }, { status });
@@ -26,6 +27,9 @@ export async function GET(request: Request): Promise<Response> {
 }
 
 export async function POST(request: Request): Promise<Response> {
+  const rejection = crossOriginRejection(request);
+  if (rejection) return rejection;
+
   let body: unknown;
   try {
     body = await request.json();

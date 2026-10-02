@@ -29,6 +29,10 @@ interface DreamSnapshot {
 
 const POLL_INTERVAL_MS = 2000;
 
+// Bounds the client wait just above the server's worst-case retry budget
+// (~4 min) so the spinner cannot hang indefinitely on a stalled POST.
+export const ANALYSIS_POST_TIMEOUT_MS = 300_000;
+
 function AnalysisBody({ analysis }: { analysis: DreamAnalysis }) {
   return (
     <>
@@ -106,7 +110,10 @@ export default function AnalysisPanel({
     setFailure(null);
     analysisRequest.current = true;
     try {
-      const res = await fetch(`/api/dreams/${dreamId}/analyze`, { method: "POST" });
+      const res = await fetch(`/api/dreams/${dreamId}/analyze`, {
+        method: "POST",
+        signal: AbortSignal.timeout(ANALYSIS_POST_TIMEOUT_MS),
+      });
       const body = (await res.json().catch(() => null)) as
         | {
             dream?: {

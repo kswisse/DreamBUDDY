@@ -1,4 +1,5 @@
 import { getRepository } from "@/lib/repository";
+import { crossOriginRejection } from "@/lib/origin";
 
 function errorResponse(status: number, code: string, message: string): Response {
   return Response.json({ error: { code, message } }, { status });
@@ -17,7 +18,10 @@ export async function GET(_request: Request, context: Context): Promise<Response
   return Response.json({ dream });
 }
 
-export async function DELETE(_request: Request, context: Context): Promise<Response> {
+export async function DELETE(request: Request, context: Context): Promise<Response> {
+  const rejection = crossOriginRejection(request);
+  if (rejection) return rejection;
+
   const { id } = await context.params;
   const removed = getRepository().remove(id);
   if (!removed) {

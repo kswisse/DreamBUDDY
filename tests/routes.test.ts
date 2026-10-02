@@ -24,6 +24,7 @@ vi.mock("@/lib/analysis/client", async (importOriginal) => {
 import { GET as listDreams, POST as createDream } from "@/app/api/dreams/route";
 import { GET as getDream, DELETE as deleteDream } from "@/app/api/dreams/[id]/route";
 import { POST as analyzeRoute } from "@/app/api/dreams/[id]/analyze/route";
+import { isActive, __setActiveForTest } from "@/lib/analysis-run";
 
 let dir: string;
 let repoToClose: ReturnType<typeof import("@/lib/dreams").createRepository> | null = null;
@@ -273,19 +274,193 @@ describe("POST /api/dreams/[id]/analyze", () => {
     expect(res.status).toBe(404);
   });
 
-  it("returns 409 when an analysis is already running", async () => {
+  it("returns 409 while a live in-process analysis is running", async () => {
     process.env.OPENAI_API_KEY = "sk-test";
     const { dream } = await createTestDream();
-    const { createRepository } = await import("@/lib/dreams");
-    repoToClose = createRepository(process.env.DREAMBUDDY_DB_PATH as string);
-    repoToClose.startAnalysis(dream.id);
+    let release!: (value: typeof analysisResult) => void;
+    analyzeMock.mockReturnValue(
+      new Promise((resolve) => {
+        release = resolve;
+      }),
+    );
 
-    const res = await analyzeRoute(
-      new Request(`http://localhost/api/dreams/${dream.id}/analyze`, { method: "POST" }),
+    const first = analyzeRoute(analyzeRequest(dream.id), {
+      params: Promise.resolve({ id: dream.id }),
+    });
+    await vi.waitFor(() => expect(analyzeMock).toHaveBeenCalledTimes(1));
+    expect(isActive(dream.id)).toBe(true);
+
+    const second = await analyzeRoute(analyzeRequest(dream.id), {
+      params: Promise.resolve({ id: dream.id }),
+    });
+    expect(second.status).toBe(409);
+    const body = (await second.json()) as { error: { code: string } };
+    expect(body.error.code).toBe("analysis_running");
+
+    release(analysisResult);
+    const firstRes = await first;
+    expect(firstRes.status).toBe(200);
+    expect(isActive(dream.id)).toBe(false);
+  });
+
+  it("returns 409 when the run registry marks the id active (test hook)", async () => {
+    process.env.OPENAI_API_KEY = "sk-test";
+    const { dream } = await createTestDream();
+    await markRunning(dream.id);
+    __setActiveForTest(dream.id, true);
+    try {
+      const res = await analyzeRoute(analyzeRequest(dream.id), {
+        params: Promise.resolve({ id: dream.id }),
+      });
+      expect(res.status).toBe(409);
+      const body = (await res.json()) as { error: { code: string } };
+      expect(body.error.code).toBe("analysis_running");
+      expect(analyzeMock).not.toHaveBeenCalled();
+    } finally {
+      __setActiveForTest(dream.id, false);
+    }
+  });
+
+  it("takes over a stale running row left by a died handler", async () => {
+    process.env.OPENAI_API_KEY = "sk-test";
+    const { dream } = await createTestDream();
+    await markRunning(dream.id);
+
+    const res = await analyzeRoute(analyzeRequest(dream.id), {
+      params: Promise.resolve({ id: dream.id }),
+    });
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as {
+      dream: { analysisStatus: string; analysis: { summary: string } };
+    };
+    expect(body.dream.analysisStatus).toBe("done");
+    expect(body.dream.analysis.summary).toBe(analysisResult.summary);
+    expect(isActive(dream.id)).toBe(false);
+  });
+
+  it("marks a stale-takeover dream failed when the model call rejects", async () => {
+    process.env.OPENAI_API_KEY = "sk-test";
+    const { AiError } = await import("@/lib/analysis/client");
+    analyzeMock.mockRejectedValue(
+      new AiError("upstream_error", "The model returned a 500."),
+    );
+    const { dream } = await createTestDream();
+    await markRunning(dream.id);
+
+    const res = await analyzeRoute(analyzeRequest(dream.id), {
+      params: Promise.resolve({ id: dream.id }),
+    });
+    expect(res.status).toBe(502);
+    const detail = await getDream(new Request("http://localhost/x"), {
+      params: Promise.resolve({ id: dream.id }),
+    });
+    const detailBody = (await detail.json()) as {
+      dream: { analysisStatus: string; analysisError: string };
+    };
+    expect(detailBody.dream.analysisStatus).toBe("failed");
+    expect(detailBody.dream.analysisError).toContain("500");
+    expect(isActive(dream.id)).toBe(false);
+  });
+});
+
+function analyzeRequest(id: string, headers?: Record<string, string>): Request {
+  return new Request(`http://localhost/api/dreams/${id}/analyze`, {
+    method: "POST",
+    headers,
+  });
+}
+
+async function markRunning(id: string): Promise<void> {
+  const { createRepository } = await import("@/lib/dreams");
+  repoToClose = createRepository(process.env.DREAMBUDDY_DB_PATH as string);
+  expect(repoToClose.startAnalysis(id)).toBe(true);
+}
+
+describe("cross-origin protection", () => {
+  const evil = { origin: "http://evil.example" };
+
+  it("rejects POST /api/dreams with a foreign Origin", async () => {
+    const res = await createDream(
+      post("http://localhost/api/dreams", {
+        content: "Injected spam.",
+        dreamDate: "2026-09-25",
+      }),
+    );
+    const withOrigin = await createDream(
+      new Request("http://localhost/api/dreams", {
+        method: "POST",
+        headers: { "content-type": "application/json", ...evil },
+        body: JSON.stringify({ content: "Injected spam.", dreamDate: "2026-09-25" }),
+      }),
+    );
+    expect(res.status).toBe(201);
+    expect(withOrigin.status).toBe(403);
+    const body = (await withOrigin.json()) as { error: { code: string } };
+    expect(body.error.code).toBe("forbidden_origin");
+
+    const list = await listDreams(new Request("http://localhost/api/dreams"));
+    const listBody = (await list.json()) as { dreams: unknown[] };
+    expect(listBody.dreams).toHaveLength(1);
+  });
+
+  it("rejects POST /api/dreams/[id]/analyze with a foreign Origin", async () => {
+    process.env.OPENAI_API_KEY = "sk-test";
+    const { dream } = await createTestDream();
+    const res = await analyzeRoute(analyzeRequest(dream.id, evil), {
+      params: Promise.resolve({ id: dream.id }),
+    });
+    expect(res.status).toBe(403);
+    const body = (await res.json()) as { error: { code: string } };
+    expect(body.error.code).toBe("forbidden_origin");
+    expect(analyzeMock).not.toHaveBeenCalled();
+  });
+
+  it("rejects DELETE /api/dreams/[id] with a foreign Origin", async () => {
+    const { dream } = await createTestDream();
+    const res = await deleteDream(
+      new Request(`http://localhost/api/dreams/${dream.id}`, {
+        method: "DELETE",
+        headers: evil,
+      }),
       { params: Promise.resolve({ id: dream.id }) },
     );
-    expect(res.status).toBe(409);
+    expect(res.status).toBe(403);
     const body = (await res.json()) as { error: { code: string } };
-    expect(body.error.code).toBe("analysis_running");
+    expect(body.error.code).toBe("forbidden_origin");
+
+    const check = await getDream(new Request("http://localhost/x"), {
+      params: Promise.resolve({ id: dream.id }),
+    });
+    expect(check.status).toBe(200);
+  });
+
+  it("allows a matching Origin on all three state-changing handlers", async () => {
+    process.env.OPENAI_API_KEY = "sk-test";
+    const created = await createDream(
+      new Request("http://localhost/api/dreams", {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          origin: "http://localhost",
+        },
+        body: JSON.stringify({ content: "A same-origin dream.", dreamDate: "2026-09-25" }),
+      }),
+    );
+    expect(created.status).toBe(201);
+    const { dream } = (await created.json()) as { dream: { id: string } };
+
+    const analyzed = await analyzeRoute(analyzeRequest(dream.id, { origin: "http://localhost" }), {
+      params: Promise.resolve({ id: dream.id }),
+    });
+    expect(analyzed.status).toBe(200);
+
+    const deleted = await deleteDream(
+      new Request(`http://localhost/api/dreams/${dream.id}`, {
+        method: "DELETE",
+        headers: { origin: "http://localhost" },
+      }),
+      { params: Promise.resolve({ id: dream.id }) },
+    );
+    expect(deleted.status).toBe(204);
   });
 });

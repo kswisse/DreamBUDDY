@@ -12,7 +12,8 @@ import {
 
 Object.assign(globalThis, { IS_REACT_ACT_ENVIRONMENT: true });
 
-import AnalysisPanel from "@/components/AnalysisPanel";
+import AnalysisPanel, { ANALYSIS_POST_TIMEOUT_MS } from "@/components/AnalysisPanel";
+import type { Dream } from "@/lib/dreams";
 
 const analysis = {
   summary: "A quiet flight.",
@@ -96,7 +97,10 @@ describe("AnalysisPanel", () => {
     fireEvent.click(button);
 
     await waitFor(() => {
-      expect(fetchMock).toHaveBeenCalledWith("/api/dreams/d1/analyze", { method: "POST" });
+      expect(fetchMock).toHaveBeenCalledWith("/api/dreams/d1/analyze", {
+        method: "POST",
+        signal: expect.any(AbortSignal),
+      });
     });
     await screen.findByText("A quiet flight.");
   });
@@ -326,5 +330,107 @@ describe("AnalysisPanel", () => {
 
     expect(screen.getByText("A quiet flight.")).toBeTruthy();
     expect(screen.getByText(/previously saved|last saved|still shows/i)).toBeTruthy();
+  });
+
+  it("bounds the analysis POST with a timeout signal and pins its budget", () => {
+    // > 240_000 documented server-side retry budget, so the client never
+    // gives up before the server could still answer.
+    expect(ANALYSIS_POST_TIMEOUT_MS).toBe(300_000);
+    expect(ANALYSIS_POST_TIMEOUT_MS).toBeGreaterThan(240_000);
+  });
+
+  it("surfaces the analysis_running 409 as a retryable failure", async () => {
+    fetchMock.mockResolvedValueOnce(
+      jsonResponse(
+        {
+          error: {
+            code: "analysis_running",
+            message: "An analysis is already running for this dream.",
+          },
+        },
+        409,
+      ),
+    );
+
+    const { container } = render(
+      <AnalysisPanel
+        dreamId="d1"
+        initialStatus="none"
+        initialAnalysis={null}
+        initialError=""
+        initialModel=""
+        initialAnalyzedAt={null}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "Analyze now" }));
+
+    await screen.findByText("An analysis is already running for this dream.");
+    expect(container.querySelector(".badge")?.textContent).toBe("Analysis failed");
+    expect(
+      screen.getByRole<HTMLButtonElement>("button", { name: "Retry analysis" }),
+    ).toBeTruthy();
+  });
+
+  it("shows only the plain message for a server-rendered failed dream", () => {
+    // Pinning current behavior: `failure` starts null on a detail-page
+    // reload, so the not_configured setup hint (failure?.code ===
+    // "not_configured") is only reachable on a live failure code, never from
+    // server-rendered initialError text alone.
+    const { container } = render(
+      <AnalysisPanel
+        dreamId="d1"
+        initialStatus="failed"
+        initialAnalysis={null}
+        initialError="OPENAI_API_KEY is not set. Add it to .env.local (see .env.example) to enable AI analysis."
+        initialModel=""
+        initialAnalyzedAt={null}
+      />,
+    );
+
+    expect(
+      container.querySelector(".alert-error")?.textContent,
+    ).toContain("OPENAI_API_KEY is not set");
+    expect(container.querySelector(".alert-info")).toBeNull();
+    expect(
+      screen.getByRole<HTMLButtonElement>("button", { name: "Retry analysis" }),
+    ).toBeTruthy();
+  });
+
+  it("renders a full Dream fixture from the route contract", async () => {
+    // The explicit `Dream` annotation is the compile-time contract pin
+    // between the analyze route (repo.get) and this panel; typecheck is the
+    // enforcement layer for field renames.
+    const fixture: Dream = {
+      id: "d1",
+      createdAt: "2026-09-25T10:00:00Z",
+      dreamDate: "2026-09-25",
+      title: "The quiet flight",
+      content: "I floated over a still lake.",
+      mood: "calm",
+      analysisStatus: "done",
+      analysisError: "",
+      analysis,
+      analyzedAt: "2026-09-26T00:00:00Z",
+      model: "gpt-oss-120b",
+    };
+    fetchMock.mockResolvedValueOnce(jsonResponse({ dream: fixture }));
+
+    render(
+      <AnalysisPanel
+        dreamId={fixture.id}
+        initialStatus="none"
+        initialAnalysis={null}
+        initialError=""
+        initialModel=""
+        initialAnalyzedAt={null}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "Analyze now" }));
+
+    await screen.findByText("A quiet flight.");
+    expect(screen.getByText(/gpt-oss-120b/)).toBeTruthy();
+    expect(screen.getByText("Analyzed")).toBeTruthy();
   });
 });

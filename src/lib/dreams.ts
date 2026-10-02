@@ -225,10 +225,12 @@ export function createRepository(dbPath: string): Repository {
     },
 
     failAnalysis(id: string, message: string): void {
+      // Only a running analysis may fail: a late failure must not clobber
+      // a completed analysis.
       db.prepare(
         `UPDATE dreams
             SET analysis_status = 'failed', analysis_error = ?
-          WHERE id = ?`,
+          WHERE id = ? AND analysis_status = 'running'`,
       ).run(message, id);
     },
 

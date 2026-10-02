@@ -115,6 +115,46 @@ describe("create", () => {
       repo.create({ content: "x".repeat(20001), dreamDate: "2026-09-25" }),
     ).toThrow(ValidationError);
   });
+
+  it("rejects a title above the length limit", () => {
+    const create = () =>
+      repo.create({
+        content: "Valid content here.",
+        dreamDate: "2026-09-25",
+        title: "t".repeat(201),
+      });
+    expect(create).toThrow(ValidationError);
+    expect(create).toThrow("Title must be at most 200 characters.");
+  });
+
+  it("accepts a title at exactly the length limit", () => {
+    const dream = repo.create({
+      content: "Valid content here.",
+      dreamDate: "2026-09-25",
+      title: "t".repeat(200),
+    });
+    expect(dream.title).toBe("t".repeat(200));
+  });
+
+  it("rejects a mood above the length limit", () => {
+    const create = () =>
+      repo.create({
+        content: "Valid content here.",
+        dreamDate: "2026-09-25",
+        mood: "m".repeat(65),
+      });
+    expect(create).toThrow(ValidationError);
+    expect(create).toThrow("Mood must be at most 64 characters.");
+  });
+
+  it("accepts a mood at exactly the length limit", () => {
+    const dream = repo.create({
+      content: "Valid content here.",
+      dreamDate: "2026-09-25",
+      mood: "m".repeat(64),
+    });
+    expect(dream.mood).toBe("m".repeat(64));
+  });
 });
 
 describe("list", () => {
@@ -134,6 +174,21 @@ describe("list", () => {
 
   it("returns an empty array for a fresh database", () => {
     expect(repo.list()).toEqual([]);
+  });
+
+  it("rejects limits outside 1..100 or non-integers", () => {
+    const message = "limit must be an integer between 1 and 100.";
+    for (const limit of [0, 101, 1.5]) {
+      expect(() => repo.list({ limit })).toThrow(ValidationError);
+      expect(() => repo.list({ limit })).toThrow(message);
+    }
+  });
+
+  it("accepts the limit boundaries 1 and 100", () => {
+    repo.create({ content: "one", dreamDate: "2026-09-01" });
+    expect(() => repo.list({ limit: 1 })).not.toThrow();
+    expect(() => repo.list({ limit: 100 })).not.toThrow();
+    expect(repo.list({ limit: 1 })).toHaveLength(1);
   });
 });
 
@@ -242,6 +297,20 @@ describe("analysis lifecycle", () => {
     const dream = repo.create({ content: "never started", dreamDate: "2026-09-25" });
     repo.completeAnalysis(dream.id, analysis, "gpt-oss-120b");
     expect(repo.get(dream.id)?.analysisStatus).toBe("none");
+  });
+
+  it("ignores a late failure for a dream that already completed", () => {
+    const dream = repo.create({ content: "late failure", dreamDate: "2026-09-25" });
+    repo.startAnalysis(dream.id);
+    repo.completeAnalysis(dream.id, analysis, "gpt-oss-120b");
+
+    repo.failAnalysis(dream.id, "post-success crash");
+
+    const after = repo.get(dream.id);
+    expect(after?.analysisStatus).toBe("done");
+    expect(after?.analysis).toEqual(analysis);
+    expect(after?.analysisError).toBe("");
+    expect(after?.model).toBe("gpt-oss-120b");
   });
 });
 
